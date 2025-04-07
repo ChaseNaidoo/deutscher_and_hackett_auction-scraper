@@ -8,13 +8,68 @@ import os
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+async def scrape_past_auctions(crawler, url):
+    """Scrapes all auction details from the past auctions page for 2015 onwards."""
+    try:
+        result = await crawler.arun(url=url)
+        if not result.success:
+            logging.error(f"Failed to crawl {url}")
+            return []
+
+        soup = BeautifulSoup(result.html, "html.parser")
+        auctions_data = []
+        year_headings = soup.select("h3")
+
+        for year_heading in year_headings:
+            year = year_heading.get_text(strip=True).strip()
+            if year.isdigit() and int(year) <= 2014:
+                logging.info(f"Stopping at year {year}")
+                break
+
+            next_element = year_heading.find_next_sibling()
+            while next_element and next_element.name != "h3":
+                if next_element.get("class", []) and "views-row" in next_element["class"]:
+                    auction_link = next_element.find("a", href=True)
+                    if auction_link and "/auctions/past" not in auction_link["href"]:
+                        title = auction_link.get_text(strip=True)
+                        url = auction_link["href"]
+                        if url.startswith("/"):
+                            url = f"https://www.deutscherandhackett.com{url}"
+
+                        location_div = next_element.find("div", class_="field-name-field-auction-location")
+                        location = location_div.find("div", class_="field-item").get_text(strip=True) if location_div else "No location found"
+
+                        date_div = next_element.find("div", class_="field-name-field-auction-date")
+                        date = date_div.find("span", class_="date-display-single").get_text(strip=True) if date_div else "No date found"
+
+                        sale_div = next_element.find("div", class_="field-name-field-auction-number")
+                        sale_number = sale_div.find("div", class_="field-item").get_text(strip=True) if sale_div else "No sale number found"
+
+                        auctions_data.append({
+                            "url": url,
+                            "title": title,
+                            "year": year,
+                            "location": location,
+                            "date": date,
+                            "sale_number": sale_number,
+                            "lots": []
+                        })
+
+                next_element = next_element.find_next_sibling()
+
+        return auctions_data
+
+    except Exception as e:
+        logging.error(f"Error scraping {url}: {str(e)}")
+        return []
+
 async def scrape_lot_details(crawler, lot_url):
     """Scrapes details from an individual lot page."""
     try:
         if lot_url.startswith("/"):
             lot_url = f"https://www.deutscherandhackett.com{lot_url}"
 
-        await asyncio.sleep(1)  # Delay to avoid rate-limiting
+        await asyncio.sleep(2)  # Increased delay to avoid rate-limiting
         result = await crawler.arun(url=lot_url)  # Adjust js_execution if needed
         if not result.success:
             logging.error(f"Failed to crawl lot page {lot_url}")
@@ -47,7 +102,8 @@ async def scrape_lot_details(crawler, lot_url):
         sold_price = sold_price_div.get_text(strip=True).split("in")[0].replace("Sold for", "").strip() if sold_price_div else None
 
         if not sold_price:
-            return None
+            logging.warning(f"No sold price found for lot: {lot_url}")
+            sold_price = "Price not found on lot page"
 
         return {
             "artist": artist,
@@ -91,14 +147,20 @@ async def scrape_auction_details(crawler, auction):
                 if lot_link:
                     tasks.append(scrape_lot_details(crawler, lot_link["href"]))
                 else:
-                    logging.warning(f"Sold item found but no lot link in row for auction: {auction['url']}")
+                    sold_price = sold_price_div.get_text(strip=True).split("in")[0].replace("Sold for", "").strip()
+                    logging.warning(f"Sold item found but no lot link in row for auction: {auction['url']}, recording price: {sold_price}")
+                    auction["lots"].append({
+                        "price": sold_price,
+                        "url": auction["url"] + "#lot-without-link-" + str(sold_count)
+                    })
+
         logging.info(f"Identified {sold_count} sold lots for auction: {auction['url']}")
 
         lot_details = await asyncio.gather(*tasks)
-        auction["lots"] = [
+        auction["lots"].extend([
             {**lot, "auctionUrl": auction["url"]}
             for lot in lot_details if lot is not None
-        ]
+        ])
         logging.info(f"Scraped {len(auction['lots'])} lots for auction: {auction['url']}")
         if sold_count != len(auction["lots"]):
             logging.warning(f"Mismatch: Identified {sold_count} sold lots, but only scraped {len(auction['lots'])}")
@@ -108,37 +170,36 @@ async def scrape_auction_details(crawler, auction):
         logging.error(f"Error scraping auction details for {auction['url']}: {str(e)}")
         return False
 
-def save_progress(auctions_data, filename="single_auction.json"):
+def save_progress(auctions_data, filename="auctions_with_lots.json"):
     """Saves the current state of auctions_data to a JSON file."""
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(auctions_data, f, indent=4)
     logging.info(f"Progress saved to {filename}")
 
 async def main():
-    # Define the specific auction to scrape (e.g., the last incomplete one)
-    auction_url = "https://www.deutscherandhackett.com/81-important-australian-indigenous-art"
-    output_file = "single_auction.json"
-
-    # Create a single auction dictionary
-    auction = {
-        "url": auction_url,
-        "title": "Beyond Sacred: Aboriginal Art, The Laverty Collection",  # Optional, can be scraped if needed
-        "year": "2015",  # Optional
-        "location": "Sydney",  # Optional
-        "date": "8 March 2015",  # Optional
-        "sale_number": "38",  # Optional
-        "lots": []
-    }
-    auctions_data = [auction]  # List with one auction
+    base_url = "https://www.deutscherandhackett.com/auctions/past"
+    output_file = "auctions_with_lots.json"
 
     async with AsyncWebCrawler() as crawler:
-        # Process only this auction
-        success = await scrape_auction_details(crawler, auction)
-        if success:
-            logging.info(f"Successfully processed auction: {auction['url']}")
-        save_progress(auctions_data, output_file)
+        # Load existing data if available, otherwise scrape auction list
+        if os.path.exists(output_file):
+            with open(output_file, "r", encoding="utf-8") as f:
+                auctions_data = json.load(f)
+            logging.info(f"Loaded existing data with {len(auctions_data)} auctions from {output_file}")
+        else:
+            auctions_data = await scrape_past_auctions(crawler, base_url)
+            logging.info(f"Scraped {len(auctions_data)} auctions from {base_url}")
+            save_progress(auctions_data)
 
-        logging.info(f"Scraping complete. Processed 1 auction. Data saved in {output_file}")
+        # Process each auction
+        completed_auctions = 0
+        for auction in auctions_data:
+            success = await scrape_auction_details(crawler, auction)
+            if success:
+                completed_auctions += 1
+            save_progress(auctions_data)  # Save after each auction for progress tracking
+
+        logging.info(f"Scraping complete. Processed {completed_auctions} out of {len(auctions_data)} auctions. Final data saved in {output_file}")
 
 if __name__ == "__main__":
     asyncio.run(main())
