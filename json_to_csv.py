@@ -6,7 +6,7 @@ import os
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-def json_to_csv(json_filename="auctions_with_lots.json", csv_filename="auctions_with_lots.csv"):
+def json_to_csv(json_filename="menzies_auctions_test_first.json", csv_filename="menzies_auctions_test_first.csv"):
     """Converts the JSON data from auctions to a CSV file."""
     try:
         # Check if JSON file exists
@@ -46,4 +46,4 @@ def json_to_csv(json_filename="auctions_with_lots.json", csv_filename="auctions_
         logging.error(f"Error converting JSON to CSV: {str(e)}")
 
 if __name__ == "__main__":
-    json_to_csv()  # Uses default filenames: auctions_with_lots.json -> auctions_with_lots.csv
+    json_to_csv()

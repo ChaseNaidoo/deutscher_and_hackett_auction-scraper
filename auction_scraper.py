@@ -4,12 +4,14 @@ from crawl4ai import AsyncWebCrawler
 from bs4 import BeautifulSoup
 import logging
 import os
+import re
+from urllib.parse import urljoin
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 async def scrape_past_auctions(crawler, url):
-    """Scrapes all auction details from the past auctions page for 2015 onwards."""
+    """Scrapes the first auction from the past auctions page for testing."""
     try:
         result = await crawler.arun(url=url)
         if not result.success:
@@ -18,44 +20,73 @@ async def scrape_past_auctions(crawler, url):
 
         soup = BeautifulSoup(result.html, "html.parser")
         auctions_data = []
-        year_headings = soup.select("h3")
+        valid_years = {str(year) for year in range(2015, 2026)}  # 2015 to 2025
 
-        for year_heading in year_headings:
-            year = year_heading.get_text(strip=True).strip()
-            if year.isdigit() and int(year) <= 2014:
-                logging.info(f"Stopping at year {year}")
-                break
+        # Find catalogue entries
+        catalogue_divs = soup.select("div.pageCatalogue")
+        logging.info(f"Found {len(catalogue_divs)} catalogue divs")
 
-            next_element = year_heading.find_next_sibling()
-            while next_element and next_element.name != "h3":
-                if next_element.get("class", []) and "views-row" in next_element["class"]:
-                    auction_link = next_element.find("a", href=True)
-                    if auction_link and "/auctions/past" not in auction_link["href"]:
-                        title = auction_link.get_text(strip=True)
-                        url = auction_link["href"]
-                        if url.startswith("/"):
-                            url = f"https://www.deutscherandhackett.com{url}"
+        # Process only the first catalogue
+        if not catalogue_divs:
+            logging.error("No catalogue divs found")
+            return []
 
-                        location_div = next_element.find("div", class_="field-name-field-auction-location")
-                        location = location_div.find("div", class_="field-item").get_text(strip=True) if location_div else "No location found"
+        catalogue = catalogue_divs[0]  # First auction only
+        # Extract year from pageCatDesc
+        date_elem = catalogue.find("p", class_="pageCatDesc")
+        year = None
+        date_text = ""
+        if date_elem:
+            date_text = date_elem.get_text(strip=True)
+            year_match = re.search(r"\b(202[0-5]|201[5-9])\b", date_text)
+            year = year_match.group(1) if year_match else None
+            logging.info(f"Date text: {date_text}, Extracted year: {year}")
 
-                        date_div = next_element.find("div", class_="field-name-field-auction-date")
-                        date = date_div.find("span", class_="date-display-single").get_text(strip=True) if date_div else "No date found"
+        # Fallback: Check for year in anchor or headers
+        if not year:
+            year_anchor = catalogue.find_previous("a", id=re.compile(r"year-\d+"))
+            if year_anchor:
+                year = year_anchor["id"].replace("year-", "")
+            else:
+                for elem in [catalogue.find_previous("h2"), catalogue.find_previous("h3"), catalogue]:
+                    if elem:
+                        text = elem.get_text(strip=True)
+                        year_match = re.search(r"\b(202[0-5]|201[5-9])\b", text)
+                        if year_match:
+                            year = year_match.group(1)
+                            break
+            logging.info(f"Fallback year: {year}")
 
-                        sale_div = next_element.find("div", class_="field-name-field-auction-number")
-                        sale_number = sale_div.find("div", class_="field-item").get_text(strip=True) if sale_div else "No sale number found"
+        # Skip if year is not in valid range
+        if year not in valid_years:
+            logging.info(f"Skipping catalogue with year {year} (not in 2015-2025)")
+            return []
 
-                        auctions_data.append({
-                            "url": url,
-                            "title": title,
-                            "year": year,
-                            "location": location,
-                            "date": date,
-                            "sale_number": sale_number,
-                            "lots": []
-                        })
+        title_elem = catalogue.find("h3", class_="pageCatTitle") or catalogue.find("h4") or catalogue.find("h2")
+        title = title_elem.get_text(strip=True) if title_elem else "No title found"
 
-                next_element = next_element.find_next_sibling()
+        date = date_text if date_text else "No date found"
+
+        sale_total_elem = catalogue.find("li", string=re.compile("Sale Total:", re.I)) or \
+                         catalogue.find("p", string=re.compile("Sale Total:", re.I))
+        sale_total = sale_total_elem.get_text(strip=True).replace("Sale Total: ", "") if sale_total_elem else "No sale total found"
+
+        auction_link = catalogue.find("a", class_="buTTon", href=True) or \
+                      catalogue.find("a", href=re.compile(r"/catalogue-details/"))
+        auction_url = auction_link["href"] if auction_link else ""
+        if auction_url.startswith("/"):
+            auction_url = urljoin("https://www.menziesartbrands.com", auction_url)
+
+        if auction_url:
+            auctions_data.append({
+                "url": auction_url,
+                "title": title,
+                "year": year,
+                "date": date,
+                "sale_total": sale_total,
+                "lots": []
+            })
+            logging.info(f"Collected auction: {title} (Year: {year}, URL: {auction_url})")
 
         return auctions_data
 
@@ -64,55 +95,102 @@ async def scrape_past_auctions(crawler, url):
         return []
 
 async def scrape_lot_details(crawler, lot_url):
-    """Scrapes details from an individual lot page."""
+    """Scrapes artist, title, medium, size, and price sold from an individual lot page."""
     try:
         if lot_url.startswith("/"):
-            lot_url = f"https://www.deutscherandhackett.com{lot_url}"
+            lot_url = urljoin("https://www.menziesartbrands.com", lot_url)
 
-        await asyncio.sleep(2)  # Increased delay to avoid rate-limiting
-        result = await crawler.arun(url=lot_url)  # Adjust js_execution if needed
+        await asyncio.sleep(1)  # Delay to avoid rate-limiting
+        result = await crawler.arun(url=lot_url)
         if not result.success:
             logging.error(f"Failed to crawl lot page {lot_url}")
             return None
 
         soup = BeautifulSoup(result.html, "html.parser")
+        description_div = soup.find("div", class_="pageLotDescriptionTxt")
+        details_div = soup.find("div", class_="pageLotDetails")
 
-        artist_div = soup.find("div", class_="field-name-field-lot-artist")
-        artist = artist_div.find("p").get_text(strip=True) if artist_div and artist_div.find("p") else "Unknown Artist"
+        # Extract artist
+        artist = "Unknown Artist"
+        if description_div:
+            artist_p = description_div.find("p")
+            artist = artist_p.get_text(strip=True) if artist_p else artist
+        else:
+            logging.warning(f"No description div found on lot page {lot_url}")
 
-        title_div = soup.find("div", class_="field-lot-title")
-        artwork_title = title_div.get_text(strip=True) if title_div else "Unknown Title"
+        # Extract title
+        title = "Unknown Title"
+        if description_div and artist_p:
+            title_p = artist_p.find_next("p")
+            if title_p:
+                title_elem = title_p.find("i")
+                title = title_elem.get_text(strip=True) if title_elem else title
 
-        medium_div = soup.find("div", class_="field-name-field-lot-medium")
-        medium = medium_div.find("p").get_text(strip=True) if medium_div and medium_div.find("p") else "Unknown Medium"
+        # Extract medium and size
+        medium = "Unknown Medium"
+        size = "Not specified"
+        if description_div and title_p:
+            medium_size_p = title_p.find_next("p")
+            if medium_size_p:
+                lines = [line.strip() for line in medium_size_p.get_text().split("\n") if line.strip()]
+                if lines:
+                    medium = lines[0]
+                if len(lines) > 1:
+                    size = lines[1]
 
-        size_div = soup.find("div", class_="field-name-field-lot-size")
-        size = size_div.find("p").get_text(strip=True) if size_div and size_div.find("p") else "Not specified"
+        # Extract sold price
+        sold_price = None
+        # Try Sold For in pageLotDetails
+        if details_div:
+            for p in details_div.find_all("p"):
+                if p.find("strong", string=re.compile(r"Sold For:", re.I)):
+                    price_spans = p.find_all("span", class_="price")
+                    if price_spans:
+                        price_text = price_spans[0].get_text(strip=True).replace(",", "")
+                        try:
+                            price_num = int(price_text)
+                            sold_price = f"${price_num:,}"
+                            logging.info(f"Found Sold For price: {sold_price} on {lot_url}")
+                        except ValueError:
+                            logging.warning(f"Invalid price format in Sold For span: {price_text} on {lot_url}")
+                        break
+                    else:
+                        logging.warning(f"No price span found in Sold For p tag on {lot_url}")
+            else:
+                logging.debug(f"No Sold For p tag found in pageLotDetails on {lot_url}")
+        else:
+            logging.warning(f"No pageLotDetails div found on {lot_url}")
 
-        signed_div = soup.find("div", class_="field-name-field-lot-signed")
-        signed = signed_div.find("p").get_text(strip=True) if signed_div and signed_div.find("p") else "No signage found"
+        # Try Result Hammer in pageLotDescriptionTxt
+        if sold_price is None and description_div:
+            for p in description_div.find_all("p"):
+                if p.find("strong", string=re.compile(r"Result Hammer:", re.I)):
+                    price_span = p.find("span", class_="price")
+                    if price_span:
+                        price_text = price_span.get_text(strip=True).replace(",", "")
+                        try:
+                            price_num = int(price_text)
+                            sold_price = f"${price_num:,}"
+                            logging.info(f"Found Result Hammer price: {sold_price} on {lot_url}")
+                        except ValueError:
+                            logging.warning(f"Invalid price format in Result Hammer span: {price_text} on {lot_url}")
+                        break
+                    else:
+                        logging.warning(f"No price span found in Result Hammer p tag on {lot_url}")
+            else:
+                logging.debug(f"No Result Hammer p tag found in pageLotDescriptionTxt on {lot_url}")
 
-        provenance_div = soup.find("div", class_="field-name-field-lot-provenance")
-        provenance = provenance_div.find("p").get_text(strip=True) if provenance_div and provenance_div.find("p") else "Not specified"
+        # If no sold price found, skip the lot
+        if sold_price is None:
+            logging.info(f"No sold price found, skipping lot {lot_url}")
+            return None
 
-        condition_div = soup.find("div", class_="field-name-field-lot-condition")
-        condition = condition_div.find("p").get_text(strip=True) if condition_div and condition_div.find("p") else "Not specified"
-
-        sold_price_div = soup.find("div", class_="field-price-sold")
-        sold_price = sold_price_div.get_text(strip=True).split("in")[0].replace("Sold for", "").strip() if sold_price_div else None
-
-        if not sold_price:
-            logging.warning(f"No sold price found for lot: {lot_url}")
-            sold_price = "Price not found on lot page"
-
+        logging.info(f"Scraped lot: {artist} - {title} (Price: {sold_price}) on {lot_url}")
         return {
             "artist": artist,
-            "title": artwork_title,
+            "title": title,
             "medium": medium,
             "size": size,
-            "signage": signed,
-            "provenance": provenance,
-            "condition": condition,
             "price": sold_price,
             "url": lot_url
         }
@@ -122,84 +200,102 @@ async def scrape_lot_details(crawler, lot_url):
         return None
 
 async def scrape_auction_details(crawler, auction):
-    """Scrapes lot details from an auction page and follows sold lot links."""
+    """Scrapes lot details from an auction page, handling pagination."""
     try:
         if auction["lots"]:
             logging.info(f"Skipping already processed auction: {auction['url']}")
             return True
 
-        result = await crawler.arun(url=auction["url"])
-        if not result.success:
-            logging.error(f"Failed to crawl auction page {auction['url']}")
-            return False
+        base_url = auction["url"]
+        page = 1
+        all_lots = []
 
-        soup = BeautifulSoup(result.html, "html.parser")
-        lot_rows = soup.select("div.views-row")
-        logging.info(f"Found {len(lot_rows)} total lots on page for auction: {auction['url']}")
+        while True:
+            url = f"{base_url}?page={page}" if page > 1 else base_url
+            result = await crawler.arun(url=url)
+            if not result.success:
+                logging.error(f"Failed to crawl auction page {url}")
+                break
 
-        tasks = []
-        sold_count = 0
-        for row in lot_rows:
-            sold_price_div = row.find("div", class_="field-price-sold")
-            if sold_price_div:
-                sold_count += 1
-                lot_link = row.find("a", href=lambda h: h and "/auction/lot/" in h)
+            soup = BeautifulSoup(result.html, "html.parser")
+            lot_rows = soup.select("div.pageListing")
+            if not lot_rows:
+                logging.info(f"No more lots found on page {page} for auction: {base_url}")
+                break
+
+            logging.info(f"Found {len(lot_rows)} lots on page {page} for auction: {base_url}")
+
+            tasks = []
+            for row in lot_rows:
+                # Look for lot link
+                lot_link = row.find("a", class_="buTTon", href=re.compile(r"/items/\d+"))
                 if lot_link:
-                    tasks.append(scrape_lot_details(crawler, lot_link["href"]))
+                    lot_url = urljoin("https://www.menziesartbrands.com", lot_link["href"])
+                    logging.info(f"Found lot link: {lot_url}")
+                    tasks.append(scrape_lot_details(crawler, lot_url))
                 else:
-                    sold_price = sold_price_div.get_text(strip=True).split("in")[0].replace("Sold for", "").strip()
-                    logging.warning(f"Sold item found but no lot link in row for auction: {auction['url']}, recording price: {sold_price}")
-                    auction["lots"].append({
-                        "price": sold_price,
-                        "url": auction["url"] + "#lot-without-link-" + str(sold_count)
-                    })
+                    logging.warning(f"No lot link found in row for auction: {base_url}")
 
-        logging.info(f"Identified {sold_count} sold lots for auction: {auction['url']}")
+                # Log price presence for context
+                sold_price_elem = row.find("p", string=re.compile("(Sold For|Result Hammer):", re.I))
+                if sold_price_elem:
+                    sold_price = sold_price_elem.get_text(strip=True)
+                    logging.info(f"Price found in row: {sold_price} for {base_url}")
+                else:
+                    logging.info(f"No price found in row for {base_url}")
 
-        lot_details = await asyncio.gather(*tasks)
-        auction["lots"].extend([
-            {**lot, "auctionUrl": auction["url"]}
-            for lot in lot_details if lot is not None
-        ])
-        logging.info(f"Scraped {len(auction['lots'])} lots for auction: {auction['url']}")
-        if sold_count != len(auction["lots"]):
-            logging.warning(f"Mismatch: Identified {sold_count} sold lots, but only scraped {len(auction['lots'])}")
+            lot_details = await asyncio.gather(*tasks, return_exceptions=True)
+            valid_lots = [lot for lot in lot_details if lot and not isinstance(lot, Exception)]
+            all_lots.extend([
+                {**lot, "auctionUrl": base_url}
+                for lot in valid_lots
+            ])
+
+            logging.info(f"Scraped {len(valid_lots)} valid lots from page {page} for auction: {base_url}")
+
+            # Check for next page
+            next_page = soup.select_one("div.pageListingNav a[href*='page={}']".format(page + 1))
+            if not next_page:
+                logging.info(f"No next page found after page {page} for auction: {base_url}")
+                break
+            page += 1
+            await asyncio.sleep(1)  # Avoid overwhelming the server
+
+        auction["lots"] = all_lots
+        logging.info(f"Total scraped {len(auction['lots'])} lots for auction: {base_url}")
         return True
 
     except Exception as e:
-        logging.error(f"Error scraping auction details for {auction['url']}: {str(e)}")
+        logging.error(f"Error scraping auction details for {base_url}: {str(e)}")
         return False
 
-def save_progress(auctions_data, filename="auctions_with_lots.json"):
+def save_progress(auctions_data, filename="menzies_auctions_test_first.json"):
     """Saves the current state of auctions_data to a JSON file."""
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(auctions_data, f, indent=4)
     logging.info(f"Progress saved to {filename}")
 
 async def main():
-    base_url = "https://www.deutscherandhackett.com/auctions/past"
-    output_file = "auctions_with_lots.json"
+    base_url = "https://www.menziesartbrands.com/auction/results"
+    output_file = "menzies_auctions_test_first.json"
 
     async with AsyncWebCrawler() as crawler:
-        # Load existing data if available, otherwise scrape auction list
-        if os.path.exists(output_file):
-            with open(output_file, "r", encoding="utf-8") as f:
-                auctions_data = json.load(f)
-            logging.info(f"Loaded existing data with {len(auctions_data)} auctions from {output_file}")
-        else:
-            auctions_data = await scrape_past_auctions(crawler, base_url)
-            logging.info(f"Scraped {len(auctions_data)} auctions from {base_url}")
-            save_progress(auctions_data)
+        # Step 1: Collect the first auction
+        auctions_data = await scrape_past_auctions(crawler, base_url)
+        logging.info(f"Collected {len(auctions_data)} auctions")
 
-        # Process each auction
-        completed_auctions = 0
-        for auction in auctions_data:
+        # Step 2: Scrape details for the first auction
+        if auctions_data:
+            auction = auctions_data[0]
+            logging.info(f"Processing auction: {auction['title']} ({auction['year']})")
             success = await scrape_auction_details(crawler, auction)
             if success:
-                completed_auctions += 1
-            save_progress(auctions_data)  # Save after each auction for progress tracking
+                logging.info("Successfully processed auction")
+            save_progress(auctions_data)
+        else:
+            logging.error("No auctions collected")
 
-        logging.info(f"Scraping complete. Processed {completed_auctions} out of {len(auctions_data)} auctions. Final data saved in {output_file}")
+        logging.info(f"Scraping complete. Final data saved in {output_file}")
 
 if __name__ == "__main__":
     asyncio.run(main())
